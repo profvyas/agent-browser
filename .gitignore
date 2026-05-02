@@ -1,0 +1,26 @@
+# Secrets
+.env
+*.env
+auth.json
+*.key
+*.pem
+
+# Dependencies
+node_modules/
+
+# Local browser-for-agents runtime data
+.browser-for-agents/
+.cache/
+downloads/
+
+# Local private leftovers from pre-library repo
+skills/**/local-credentials.md
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
