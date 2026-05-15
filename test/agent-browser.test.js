@@ -72,6 +72,16 @@ test("status reads runtime paths without launching a browser", () => {
   assert.deepEqual(status.allowedOrigins, ["https://example.com"]);
 });
 
+test("policy presets can provide wildcard allowed origins", () => {
+  const status = getAgentBrowserStatus({
+    homeDir: tmpHome("policy"),
+    policyName: "local"
+  });
+
+  assert.equal(status.policyName, "local");
+  assert.deepEqual(status.allowedOrigins, ["http://localhost:*", "http://127.0.0.1:*", "file://*"]);
+});
+
 test("serializeError redacts action payload values", () => {
   const error = new BrowserActionError("Fill failed", {
     actionIndex: 2,

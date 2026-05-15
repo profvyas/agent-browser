@@ -7,6 +7,10 @@ const DEFAULT_VIEWPORT = { width: 1365, height: 900 };
 const MAX_RECENT_EVENTS = 40;
 const MAX_DOWNLOAD_EVENTS = 20;
 const REDACTED_ACTION_FIELDS = new Set(["value", "values", "text", "password", "token", "secret"]);
+const BUILT_IN_POLICIES = {
+  open: { allowedOrigins: ["*"] },
+  local: { allowedOrigins: ["http://localhost:*", "http://127.0.0.1:*", "file://*"] }
+};
 
 export class BrowserActionError extends Error {
   constructor(message, details = {}) {
@@ -101,7 +105,10 @@ export class AgentBrowser {
     this.page = this.context.pages()[0] || await this.context.newPage();
     this.page.setDefaultTimeout(this.options.defaultTimeoutMs);
     this.attachPageListeners(this.page);
-    this.context.on("page", (page) => this.attachPageListeners(page));
+    this.context.on("page", (page) => {
+      page.setDefaultTimeout(this.options.defaultTimeoutMs);
+      this.attachPageListeners(page);
+    });
     return this;
   }
 
@@ -130,6 +137,7 @@ export class AgentBrowser {
       downloadEvents: this.downloadEvents,
       latestScreenshotPath: this.latestScreenshotPath
     });
+    observation.pages = await this.describePages();
 
     ensureDir(path.dirname(this.options.latestObservationPath));
     fs.writeFileSync(this.options.latestObservationPath, `${JSON.stringify(observation, null, 2)}\n`);
@@ -176,6 +184,64 @@ export class AgentBrowser {
       path: screenshotPath,
       fullPage: Boolean(options.fullPage)
     };
+  }
+
+  async newPage(url) {
+    await this.ensureStarted();
+    if (url) assertUrlAllowed(url, this.options.allowedOrigins);
+    this.page = await this.context.newPage();
+    this.page.setDefaultTimeout(this.options.defaultTimeoutMs);
+    this.attachPageListeners(this.page);
+    if (url) {
+      await this.page.goto(url, { waitUntil: "domcontentloaded" });
+    }
+    return this.page;
+  }
+
+  async switchPage(selector = {}) {
+    await this.ensureStarted();
+    const pages = this.context.pages();
+    const index = selector.index !== undefined ? Number(selector.index) : undefined;
+
+    if (Number.isInteger(index)) {
+      if (!pages[index]) throw new Error(`No page at index ${index}.`);
+      this.page = pages[index];
+      return this.page;
+    }
+
+    if (selector.url || selector.title) {
+      for (const page of pages) {
+        const title = await page.title().catch(() => "");
+        const url = page.url();
+        if ((selector.url && url.includes(selector.url)) || (selector.title && title.includes(selector.title))) {
+          this.page = page;
+          return this.page;
+        }
+      }
+    }
+
+    throw new Error("switchPage requires a matching index, url, or title.");
+  }
+
+  async closePage(selector = {}) {
+    await this.ensureStarted();
+    const page = selector.index !== undefined || selector.url || selector.title
+      ? await this.switchPage(selector)
+      : this.page;
+    await page.close();
+    this.page = this.context.pages()[0] || await this.context.newPage();
+    return this.page;
+  }
+
+  async describePages() {
+    if (!this.context) return [];
+    const pages = this.context.pages();
+    return Promise.all(pages.map(async (page, index) => ({
+      index,
+      active: page === this.page,
+      url: page.url(),
+      title: await page.title().catch(() => "")
+    })));
   }
 
   async close() {
@@ -302,6 +368,8 @@ function readStatus(options) {
     auditEnabled: options.auditEnabled,
     profileName: options.profileName,
     profileRoot: options.profileRoot,
+    policyName: options.policyName,
+    policyFile: options.policyFile,
     allowedOrigins: options.allowedOrigins,
     savedStateExists: stateExists,
     savedCookies: cookieCount,
@@ -310,31 +378,50 @@ function readStatus(options) {
 }
 
 function normalizeOptions(options) {
-  const homeDir = path.resolve(expandHome(options.homeDir || process.env.BFA_HOME || "~/.browser-for-agents"));
-  const profileName = options.profileName || process.env.BFA_PROFILE || "";
+  const policyOptions = loadPolicyOptions(options);
+  const merged = { ...policyOptions, ...options };
+  const homeDir = path.resolve(expandHome(merged.homeDir || process.env.BFA_HOME || "~/.browser-for-agents"));
+  const profileName = merged.profileName || process.env.BFA_PROFILE || "";
   const profileRoot = profileName ? path.join(homeDir, "profiles", safeName(profileName)) : homeDir;
-  const allowedOrigins = normalizeAllowedOrigins(options.allowedOrigins || process.env.BFA_ALLOWED_ORIGINS);
+  const allowedOrigins = normalizeAllowedOrigins(merged.allowedOrigins || process.env.BFA_ALLOWED_ORIGINS);
   return {
     homeDir,
     profileName,
     profileRoot,
-    profileDir: path.resolve(options.profileDir || path.join(profileRoot, "profile")),
-    storageStatePath: path.resolve(options.storageStatePath || path.join(profileRoot, "storage-state.json")),
-    downloadsDir: path.resolve(options.downloadsDir || path.join(profileRoot, "downloads")),
-    screenshotsDir: path.resolve(options.screenshotsDir || path.join(profileRoot, "screenshots")),
-    latestObservationPath: path.resolve(options.latestObservationPath || path.join(profileRoot, "latest-observation.json")),
-    auditLogPath: path.resolve(options.auditLogPath || path.join(profileRoot, "audit.jsonl")),
-    auditEnabled: options.auditEnabled ?? process.env.BFA_AUDIT_DISABLED !== "1",
-    redactAction: typeof options.redactAction === "function" ? options.redactAction : undefined,
-    executablePath: options.executablePath || process.env.BFA_BROWSER_EXE,
-    browserChannel: options.browserChannel || "chrome",
-    headless: options.headless ?? process.env.BFA_HEADLESS === "1",
-    defaultTimeoutMs: options.defaultTimeoutMs || 30000,
-    viewport: options.viewport || DEFAULT_VIEWPORT,
-    observeScreenshots: options.observeScreenshots ?? process.env.BFA_OBSERVE_SCREENSHOTS === "1",
-    observeScreenshotFullPage: options.observeScreenshotFullPage ?? process.env.BFA_OBSERVE_SCREENSHOT_FULL_PAGE === "1",
+    policyName: merged.policyName || process.env.BFA_POLICY || "",
+    policyFile: merged.policyFile || process.env.BFA_POLICY_FILE || "",
+    profileDir: path.resolve(merged.profileDir || path.join(profileRoot, "profile")),
+    storageStatePath: path.resolve(merged.storageStatePath || path.join(profileRoot, "storage-state.json")),
+    downloadsDir: path.resolve(merged.downloadsDir || path.join(profileRoot, "downloads")),
+    screenshotsDir: path.resolve(merged.screenshotsDir || path.join(profileRoot, "screenshots")),
+    latestObservationPath: path.resolve(merged.latestObservationPath || path.join(profileRoot, "latest-observation.json")),
+    auditLogPath: path.resolve(merged.auditLogPath || path.join(profileRoot, "audit.jsonl")),
+    auditEnabled: merged.auditEnabled ?? process.env.BFA_AUDIT_DISABLED !== "1",
+    redactAction: typeof merged.redactAction === "function" ? merged.redactAction : undefined,
+    executablePath: merged.executablePath || process.env.BFA_BROWSER_EXE,
+    browserChannel: merged.browserChannel || "chrome",
+    headless: merged.headless ?? process.env.BFA_HEADLESS === "1",
+    defaultTimeoutMs: merged.defaultTimeoutMs || 30000,
+    viewport: merged.viewport || DEFAULT_VIEWPORT,
+    observeScreenshots: merged.observeScreenshots ?? process.env.BFA_OBSERVE_SCREENSHOTS === "1",
+    observeScreenshotFullPage: merged.observeScreenshotFullPage ?? process.env.BFA_OBSERVE_SCREENSHOT_FULL_PAGE === "1",
     allowedOrigins
   };
+}
+
+function loadPolicyOptions(options) {
+  const policyName = options.policyName || process.env.BFA_POLICY || "";
+  const policyFile = options.policyFile || process.env.BFA_POLICY_FILE || "";
+  const builtIn = policyName ? BUILT_IN_POLICIES[policyName] : undefined;
+
+  if (policyName && !builtIn) {
+    throw new Error(`Unknown policy preset: ${policyName}`);
+  }
+
+  if (!policyFile) return builtIn || {};
+
+  const parsed = JSON.parse(fs.readFileSync(path.resolve(expandHome(policyFile)), "utf8"));
+  return { ...(builtIn || {}), ...parsed };
 }
 
 function normalizeAllowedOrigins(value) {
@@ -344,6 +431,7 @@ function normalizeAllowedOrigins(value) {
     .filter(Boolean)
     .map((entry) => {
       if (entry === "*") return entry;
+      if (entry.includes("*")) return entry;
       try {
         return new URL(entry).origin;
       } catch {
@@ -356,9 +444,17 @@ function assertUrlAllowed(url, allowedOrigins = []) {
   if (!allowedOrigins.length || allowedOrigins.includes("*")) return;
 
   const origin = new URL(url).origin;
-  if (!allowedOrigins.includes(origin)) {
+  if (!allowedOrigins.some((allowedOrigin) => originMatches(origin, allowedOrigin))) {
     throw new Error(`Navigation blocked by allowed origins policy: ${origin}`);
   }
+}
+
+function originMatches(origin, pattern) {
+  if (pattern === "*") return true;
+  if (pattern === origin) return true;
+  if (!pattern.includes("*")) return false;
+  const escaped = pattern.split("*").map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*");
+  return new RegExp(`^${escaped}$`).test(origin);
 }
 
 function expandHome(value) {
@@ -743,6 +839,16 @@ async function performAction(page, action, browser) {
       return;
     case "screenshot":
       await browser.screenshot(action);
+      return;
+    case "newPage":
+    case "openPage":
+      await browser.newPage(action.url);
+      return;
+    case "switchPage":
+      await browser.switchPage(action);
+      return;
+    case "closePage":
+      await browser.closePage(action);
       return;
     default:
       throw new Error(`Unsupported action: ${action.action}`);

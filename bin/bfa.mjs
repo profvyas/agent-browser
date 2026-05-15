@@ -7,15 +7,15 @@ import { createAgentBrowser, getAgentBrowserStatus, serializeError } from "../sr
 
 function printUsage() {
   console.log(`Usage:
-  bfa observe [url] [--pretty] [--home <dir>] [--profile <name>] [--browser <path>] [--headless] [--allow-origin <origin>] [--observe-screenshots]
-  bfa act <json-or-file> [--pretty] [--home <dir>] [--profile <name>] [--browser <path>] [--headless] [--allow-origin <origin>]
-  bfa session [url] [--home <dir>] [--profile <name>] [--browser <path>] [--headless] [--allow-origin <origin>]
+  bfa observe [url] [--pretty] [--home <dir>] [--profile <name>] [--policy <name>] [--browser <path>] [--headless] [--allow-origin <origin>] [--observe-screenshots]
+  bfa act <json-or-file> [--pretty] [--home <dir>] [--profile <name>] [--policy <name>] [--browser <path>] [--headless] [--allow-origin <origin>]
+  bfa session [url] [--home <dir>] [--profile <name>] [--policy <name>] [--browser <path>] [--headless] [--allow-origin <origin>]
   bfa screenshot [url] [--full-page] [--name <file>] [--home <dir>] [--profile <name>] [--browser <path>] [--headless]
   bfa open <url> [--home <dir>] [--profile <name>] [--browser <path>] [--allow-origin <origin>]
   bfa status [--home <dir>] [--profile <name>]
 
 Actions:
-  goto, click, type, fill, press, select, hover, scroll, wait, screenshot, upload`);
+  goto, click, type, fill, press, select, hover, scroll, wait, screenshot, upload, newPage, switchPage, closePage`);
 }
 
 function parseCli(argv) {
@@ -73,6 +73,8 @@ function browserOptions(flags) {
   return {
     homeDir: flags.home,
     profileName: flags.profile,
+    policyName: flags.policy,
+    policyFile: flags.policy_file,
     executablePath: flags.browser,
     headless: flags.headless,
     screenshotsDir: flags.screenshots,

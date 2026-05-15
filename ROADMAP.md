@@ -28,7 +28,7 @@ minimal Playwright wrapper into a safer agent browser runtime.
 ## Phase 4: OpenClaw Integration
 
 - [x] Wrap the CLI as a long-lived tool with one profile per user/domain/task.
-- Add domain policy presets for internal tools.
+- [x] Add domain policy presets for internal tools.
 - [x] Emit artifact paths and structured errors that upstream agents can reason
   about.
 - [x] Add smoke tests against local fixtures plus browser-skipped integration tests.
@@ -36,6 +36,8 @@ minimal Playwright wrapper into a safer agent browser runtime.
 ## Phase 5: Production Hardening
 
 - [x] Add audit logging and redaction hooks.
-- Add multi-tab/page selection.
+- [x] Add multi-tab/page selection.
 - [x] Add per-command timeout overrides.
-- Add CI packaging checks and release automation.
+- [blocked] Add CI packaging checks. The available GitHub PAT cannot create or
+  update `.github/workflows/*` without `workflow` scope.
+- Add release automation.

@@ -20,6 +20,8 @@ This branch extends the runtime with:
 - wait, screenshot, and upload actions
 - per-profile runtime isolation
 - redacted audit logs for action execution
+- policy presets and JSON policy files
+- basic page/tab selection actions
 
 ## Install
 
@@ -60,6 +62,13 @@ Use a separate profile for a user, domain, or task:
 
 ```sh
 bfa session https://example.com --profile example-prod --allow-origin https://example.com
+```
+
+Use a built-in policy preset or JSON policy file:
+
+```sh
+bfa observe http://localhost:3000 --policy local
+bfa session https://example.com --policy-file ./bfa-policy.json
 ```
 
 Run one action and receive a fresh observation:
@@ -104,6 +113,9 @@ Supported primitives:
 - `wait`
 - `screenshot`
 - `upload`
+- `newPage`
+- `switchPage`
+- `closePage`
 
 Examples:
 
@@ -111,6 +123,8 @@ Examples:
 {"action":"wait","text":"Dashboard","timeoutMs":5000}
 {"action":"upload","target":"label=Invoice CSV","path":"~/Downloads/invoice.csv"}
 {"action":"screenshot","name":"after-upload","fullPage":true}
+{"action":"newPage","url":"https://example.com/report"}
+{"action":"switchPage","title":"Report"}
 ```
 
 Prefer observed ids such as `e12`. Fallback targets are also supported:
@@ -204,6 +218,8 @@ Environment overrides:
 - `BFA_HEADLESS=1`: run headless
 - `BFA_ALLOWED_ORIGINS`: comma-separated origin allowlist
 - `BFA_PROFILE`: profile name for isolated runtime state
+- `BFA_POLICY`: built-in policy preset (`open` or `local`)
+- `BFA_POLICY_FILE`: path to a JSON policy file
 - `BFA_OBSERVE_SCREENSHOTS=1`: save a screenshot during every observation
 - `BFA_AUDIT_DISABLED=1`: disable action audit logging
 
@@ -213,7 +229,17 @@ Useful flags:
 bfa observe https://example.com --home /tmp/bfa --browser /path/to/chrome
 bfa observe https://example.com --allow-origin https://example.com
 bfa session https://example.com --profile customer-a
+bfa observe http://localhost:3000 --policy local
 bfa session --headless
+```
+
+Policy files are JSON and currently support the same option names as the API:
+
+```json
+{
+  "allowedOrigins": ["https://example.com"],
+  "observeScreenshots": true
+}
 ```
 
 ## Development
