@@ -6,6 +6,22 @@ import { chromium } from "playwright-core";
 const DEFAULT_VIEWPORT = { width: 1365, height: 900 };
 const MAX_RECENT_EVENTS = 40;
 const MAX_DOWNLOAD_EVENTS = 20;
+const REDACTED_ACTION_FIELDS = new Set(["value", "values", "text", "password", "token", "secret"]);
+
+export class BrowserActionError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = "BrowserActionError";
+    this.code = details.code || "BFA_ACTION_FAILED";
+    this.action = details.action;
+    this.actionIndex = details.actionIndex;
+    this.cause = details.cause;
+  }
+
+  toJSON() {
+    return serializeError(this);
+  }
+}
 
 export async function createAgentBrowser(options = {}) {
   const browser = new AgentBrowser(options);
@@ -104,6 +120,10 @@ export class AgentBrowser {
       await this.page.goto(url, { waitUntil: "domcontentloaded" });
     }
 
+    if (this.options.observeScreenshots) {
+      await this.screenshot({ name: "observe", fullPage: this.options.observeScreenshotFullPage });
+    }
+
     const observation = await buildObservation(this.page, {
       networkEvents: this.networkEvents,
       consoleEvents: this.consoleEvents,
@@ -121,8 +141,19 @@ export class AgentBrowser {
     await this.ensureStarted();
     const actions = Array.isArray(input?.actions) ? input.actions : [input];
 
-    for (const action of actions) {
-      await performAction(this.page, action, this);
+    for (let actionIndex = 0; actionIndex < actions.length; actionIndex += 1) {
+      const action = actions[actionIndex];
+      this.writeAuditEvent("action:start", { actionIndex, action });
+      try {
+        await performAction(this.page, action, this);
+        this.writeAuditEvent("action:finish", { actionIndex, action });
+      } catch (error) {
+        const wrapped = error instanceof BrowserActionError
+          ? error
+          : new BrowserActionError(error.message, { action, actionIndex, cause: error });
+        this.writeAuditEvent("action:error", { actionIndex, action, error: serializeError(wrapped) });
+        throw wrapped;
+      }
     }
 
     return this.observe();
@@ -233,6 +264,20 @@ export class AgentBrowser {
     this.downloadEvents.push(event);
     this.downloadEvents = this.downloadEvents.slice(-MAX_DOWNLOAD_EVENTS);
   }
+
+  writeAuditEvent(type, details = {}) {
+    if (!this.options.auditEnabled || !this.options.auditLogPath) return;
+
+    ensureDir(path.dirname(this.options.auditLogPath));
+    const event = {
+      ts: new Date().toISOString(),
+      type,
+      page: this.page?.url?.() || "",
+      ...details,
+      action: details.action ? redactAction(details.action, this.options.redactAction) : undefined
+    };
+    fs.appendFileSync(this.options.auditLogPath, `${JSON.stringify(removeUndefined(event))}\n`);
+  }
 }
 
 function readStatus(options) {
@@ -253,6 +298,10 @@ function readStatus(options) {
     downloads: options.downloadsDir,
     screenshots: options.screenshotsDir,
     latestObservation: options.latestObservationPath,
+    auditLog: options.auditLogPath,
+    auditEnabled: options.auditEnabled,
+    profileName: options.profileName,
+    profileRoot: options.profileRoot,
     allowedOrigins: options.allowedOrigins,
     savedStateExists: stateExists,
     savedCookies: cookieCount,
@@ -262,19 +311,28 @@ function readStatus(options) {
 
 function normalizeOptions(options) {
   const homeDir = path.resolve(expandHome(options.homeDir || process.env.BFA_HOME || "~/.browser-for-agents"));
+  const profileName = options.profileName || process.env.BFA_PROFILE || "";
+  const profileRoot = profileName ? path.join(homeDir, "profiles", safeName(profileName)) : homeDir;
   const allowedOrigins = normalizeAllowedOrigins(options.allowedOrigins || process.env.BFA_ALLOWED_ORIGINS);
   return {
     homeDir,
-    profileDir: path.resolve(options.profileDir || path.join(homeDir, "profile")),
-    storageStatePath: path.resolve(options.storageStatePath || path.join(homeDir, "storage-state.json")),
-    downloadsDir: path.resolve(options.downloadsDir || path.join(homeDir, "downloads")),
-    screenshotsDir: path.resolve(options.screenshotsDir || path.join(homeDir, "screenshots")),
-    latestObservationPath: path.resolve(options.latestObservationPath || path.join(homeDir, "latest-observation.json")),
+    profileName,
+    profileRoot,
+    profileDir: path.resolve(options.profileDir || path.join(profileRoot, "profile")),
+    storageStatePath: path.resolve(options.storageStatePath || path.join(profileRoot, "storage-state.json")),
+    downloadsDir: path.resolve(options.downloadsDir || path.join(profileRoot, "downloads")),
+    screenshotsDir: path.resolve(options.screenshotsDir || path.join(profileRoot, "screenshots")),
+    latestObservationPath: path.resolve(options.latestObservationPath || path.join(profileRoot, "latest-observation.json")),
+    auditLogPath: path.resolve(options.auditLogPath || path.join(profileRoot, "audit.jsonl")),
+    auditEnabled: options.auditEnabled ?? process.env.BFA_AUDIT_DISABLED !== "1",
+    redactAction: typeof options.redactAction === "function" ? options.redactAction : undefined,
     executablePath: options.executablePath || process.env.BFA_BROWSER_EXE,
     browserChannel: options.browserChannel || "chrome",
     headless: options.headless ?? process.env.BFA_HEADLESS === "1",
     defaultTimeoutMs: options.defaultTimeoutMs || 30000,
     viewport: options.viewport || DEFAULT_VIEWPORT,
+    observeScreenshots: options.observeScreenshots ?? process.env.BFA_OBSERVE_SCREENSHOTS === "1",
+    observeScreenshotFullPage: options.observeScreenshotFullPage ?? process.env.BFA_OBSERVE_SCREENSHOT_FULL_PAGE === "1",
     allowedOrigins
   };
 }
@@ -310,6 +368,10 @@ function expandHome(value) {
 
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
+}
+
+function safeName(value) {
+  return String(value || "default").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "default";
 }
 
 export function findBrowserExecutable() {
@@ -557,9 +619,13 @@ function collectPageData() {
 
   function actionsFor(element, role) {
     const tagName = element.tagName.toLowerCase();
+    const type = (element.getAttribute("type") || "").toLowerCase();
     const actions = ["click", "hover"];
     if (["textbox", "searchbox"].includes(role) || element.isContentEditable) {
       actions.push("fill", "type", "press");
+    }
+    if (tagName === "input" && type === "file") {
+      actions.push("upload", "setInputFiles");
     }
     if (["button", "link", "checkbox", "radio"].includes(role)) {
       actions.push("press");
@@ -640,30 +706,34 @@ async function performAction(page, action, browser) {
     case "goto":
       if (!action.url) throw new Error("goto requires url.");
       assertUrlAllowed(action.url, browser?.options.allowedOrigins);
-      await page.goto(action.url, { waitUntil: action.waitUntil || "domcontentloaded" });
+      await page.goto(action.url, { waitUntil: action.waitUntil || "domcontentloaded", timeout: actionTimeout(action) });
       return;
     case "click":
-      await withTarget(page, action.target, (locator) => locator.click());
+      await withTarget(page, action.target, (locator) => locator.click({ timeout: actionTimeout(action) }));
       return;
     case "type":
-      await withTarget(page, action.target, (locator) => locator.pressSequentially(action.value || action.text || ""));
+      await withTarget(page, action.target, (locator) => locator.pressSequentially(action.value || action.text || "", { timeout: actionTimeout(action) }));
       return;
     case "fill":
-      await withTarget(page, action.target, (locator) => locator.fill(action.value || ""));
+      await withTarget(page, action.target, (locator) => locator.fill(action.value || "", { timeout: actionTimeout(action) }));
       return;
     case "press":
       if (!action.key) throw new Error("press requires key.");
       if (action.target) {
-        await withTarget(page, action.target, (locator) => locator.press(action.key));
+        await withTarget(page, action.target, (locator) => locator.press(action.key, { timeout: actionTimeout(action) }));
       } else {
-        await page.keyboard.press(action.key);
+        await page.keyboard.press(action.key, { timeout: actionTimeout(action) });
       }
       return;
     case "select":
-      await withTarget(page, action.target, (locator) => locator.selectOption(action.value ?? action.values));
+      await withTarget(page, action.target, (locator) => locator.selectOption(action.value ?? action.values, { timeout: actionTimeout(action) }));
       return;
     case "hover":
-      await withTarget(page, action.target, (locator) => locator.hover());
+      await withTarget(page, action.target, (locator) => locator.hover({ timeout: actionTimeout(action) }));
+      return;
+    case "upload":
+    case "setInputFiles":
+      await uploadFiles(page, action);
       return;
     case "scroll":
       await scrollPage(page, action);
@@ -677,6 +747,10 @@ async function performAction(page, action, browser) {
     default:
       throw new Error(`Unsupported action: ${action.action}`);
   }
+}
+
+function actionTimeout(action) {
+  return action.timeoutMs || action.timeout || undefined;
 }
 
 async function waitFor(page, action) {
@@ -709,6 +783,14 @@ async function waitFor(page, action) {
   }
 
   await page.waitForTimeout(action.ms || 1000);
+}
+
+async function uploadFiles(page, action) {
+  if (!action.target) throw new Error(`${action.action} requires target.`);
+  const files = action.path || action.paths || action.files || action.file;
+  if (!files) throw new Error(`${action.action} requires path, paths, file, or files.`);
+  const normalized = Array.isArray(files) ? files.map(resolveFilePath) : resolveFilePath(files);
+  await withTarget(page, action.target, (locator) => locator.setInputFiles(normalized, { timeout: actionTimeout(action) }));
 }
 
 async function withTarget(page, target, fn) {
@@ -778,7 +860,8 @@ function locatorForElementHandle(page, element) {
       await page.keyboard.type(value);
     },
     selectOption: (...args) => element.selectOption(...args),
-    hover: (...args) => element.hover(...args)
+    hover: (...args) => element.hover(...args),
+    setInputFiles: (...args) => element.setInputFiles(...args)
   };
 }
 
@@ -814,4 +897,46 @@ function uniqueArtifactName(name) {
   const safeExt = parsed.ext || "";
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   return `${stamp}-${safeBase}${safeExt}`;
+}
+
+function resolveFilePath(filePath) {
+  return path.resolve(expandHome(String(filePath)));
+}
+
+function redactAction(action, customRedactor) {
+  if (customRedactor) return customRedactor(action);
+  return redactValue(action);
+}
+
+function redactValue(value, key = "") {
+  if (Array.isArray(value)) {
+    return value.map((entry) => redactValue(entry, key));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([entryKey, entryValue]) => [
+      entryKey,
+      redactValue(entryValue, entryKey)
+    ]));
+  }
+
+  if (REDACTED_ACTION_FIELDS.has(key) || /password|token|secret/i.test(key)) {
+    return "[redacted]";
+  }
+
+  return value;
+}
+
+export function serializeError(error) {
+  return removeUndefined({
+    name: error.name || "Error",
+    code: error.code,
+    message: error.message,
+    actionIndex: error.actionIndex,
+    action: error.action ? redactAction(error.action) : undefined
+  });
+}
+
+function removeUndefined(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, entryValue]) => entryValue !== undefined));
 }

@@ -3,19 +3,19 @@
 import fs from "node:fs";
 import process from "node:process";
 import readline from "node:readline";
-import { createAgentBrowser, getAgentBrowserStatus } from "../src/index.js";
+import { createAgentBrowser, getAgentBrowserStatus, serializeError } from "../src/index.js";
 
 function printUsage() {
   console.log(`Usage:
-  bfa observe [url] [--pretty] [--home <dir>] [--browser <path>] [--headless] [--allow-origin <origin>]
-  bfa act <json-or-file> [--pretty] [--home <dir>] [--browser <path>] [--headless] [--allow-origin <origin>]
-  bfa session [url] [--home <dir>] [--browser <path>] [--headless] [--allow-origin <origin>]
-  bfa screenshot [url] [--full-page] [--name <file>] [--home <dir>] [--browser <path>] [--headless]
-  bfa open <url> [--home <dir>] [--browser <path>] [--allow-origin <origin>]
-  bfa status [--home <dir>]
+  bfa observe [url] [--pretty] [--home <dir>] [--profile <name>] [--browser <path>] [--headless] [--allow-origin <origin>] [--observe-screenshots]
+  bfa act <json-or-file> [--pretty] [--home <dir>] [--profile <name>] [--browser <path>] [--headless] [--allow-origin <origin>]
+  bfa session [url] [--home <dir>] [--profile <name>] [--browser <path>] [--headless] [--allow-origin <origin>]
+  bfa screenshot [url] [--full-page] [--name <file>] [--home <dir>] [--profile <name>] [--browser <path>] [--headless]
+  bfa open <url> [--home <dir>] [--profile <name>] [--browser <path>] [--allow-origin <origin>]
+  bfa status [--home <dir>] [--profile <name>]
 
 Actions:
-  goto, click, type, fill, press, select, hover, scroll, wait, screenshot`);
+  goto, click, type, fill, press, select, hover, scroll, wait, screenshot, upload`);
 }
 
 function parseCli(argv) {
@@ -33,7 +33,7 @@ function parseCli(argv) {
     const key = rawKey.replaceAll("-", "_");
     if (rawValue !== undefined) {
       setFlag(flags, key, rawValue);
-    } else if (["pretty", "headless", "full_page"].includes(key)) {
+    } else if (booleanFlag(key)) {
       flags[key] = true;
     } else {
       setFlag(flags, key, argv[i + 1]);
@@ -50,7 +50,7 @@ function setFlag(flags, key, value) {
     return;
   }
 
-  if (["pretty", "headless", "full_page"].includes(key)) {
+  if (booleanFlag(key)) {
     flags[key] = value === true || value === "true";
     return;
   }
@@ -58,12 +58,28 @@ function setFlag(flags, key, value) {
   flags[key] = value;
 }
 
+function booleanFlag(key) {
+  return [
+    "pretty",
+    "headless",
+    "full_page",
+    "observe_screenshots",
+    "observe_screenshot_full_page",
+    "audit_disabled"
+  ].includes(key);
+}
+
 function browserOptions(flags) {
   return {
     homeDir: flags.home,
+    profileName: flags.profile,
     executablePath: flags.browser,
     headless: flags.headless,
     screenshotsDir: flags.screenshots,
+    auditLogPath: flags.audit_log,
+    auditEnabled: flags.audit_disabled === undefined ? undefined : !flags.audit_disabled,
+    observeScreenshots: flags.observe_screenshots,
+    observeScreenshotFullPage: flags.observe_screenshot_full_page,
     allowedOrigins: flags.allow_origin
   };
 }
@@ -106,7 +122,7 @@ async function runSession(browser, startUrl) {
       const observation = await browser.act(command);
       process.stdout.write(`${JSON.stringify(observation)}\n`);
     } catch (error) {
-      process.stdout.write(`${JSON.stringify({ error: { message: error.message } })}\n`);
+      process.stdout.write(`${JSON.stringify({ error: serializeError(error) })}\n`);
     }
   }
 }
