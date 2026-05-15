@@ -1,0 +1,40 @@
+{
+  "name": "browser-for-agents",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "A minimal visible browser interface for agents: observe JSON, act like a human, observe again.",
+  "license": "MIT",
+  "bin": {
+    "bfa": "./bin/bfa.mjs"
+  },
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "examples/",
+    "README.md",
+    "ROADMAP.md",
+    "INSTALLATION.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "pack:check": "npm pack --dry-run"
+  },
+  "keywords": [
+    "agent",
+    "browser",
+    "automation",
+    "playwright",
+    "cli"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "playwright-core": "^1.52.0"
+  }
+}

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Fixture page for browser-for-agents tests.">
+    <title>BFA Fixture</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 32px; }
+      label, select, button, a { display: block; margin-top: 16px; }
+      #result { margin-top: 24px; }
+      .spacer { height: 1200px; }
+    </style>
+  </head>
+  <body>
+    <h1>Agent Test Page</h1>
+    <form id="search-form">
+      <label for="query">Search query</label>
+      <input id="query" name="query" placeholder="Search inventory">
+      <label for="channel">Channel</label>
+      <select id="channel" name="channel">
+        <option value="zepto">Zepto</option>
+        <option value="blinkit">Blinkit</option>
+      </select>
+      <button id="submit" type="button">Run search</button>
+    </form>
+    <a href="#bottom">Jump to bottom</a>
+    <div id="result" role="status"></div>
+    <div class="spacer"></div>
+    <button id="bottom">Bottom button</button>
+    <script>
+      document.querySelector("#submit").addEventListener("click", () => {
+        const query = document.querySelector("#query").value;
+        const channel = document.querySelector("#channel").value;
+        document.querySelector("#result").textContent = `${query} on ${channel}`;
+      });
+    </script>
+  </body>
+</html>
