@@ -7,14 +7,15 @@ import { createAgentBrowser, getAgentBrowserStatus } from "../src/index.js";
 
 function printUsage() {
   console.log(`Usage:
-  bfa observe [url] [--pretty] [--home <dir>] [--browser <path>] [--headless]
-  bfa act <json-or-file> [--pretty] [--home <dir>] [--browser <path>] [--headless]
-  bfa session [url] [--home <dir>] [--browser <path>] [--headless]
-  bfa open <url> [--home <dir>] [--browser <path>]
+  bfa observe [url] [--pretty] [--home <dir>] [--browser <path>] [--headless] [--allow-origin <origin>]
+  bfa act <json-or-file> [--pretty] [--home <dir>] [--browser <path>] [--headless] [--allow-origin <origin>]
+  bfa session [url] [--home <dir>] [--browser <path>] [--headless] [--allow-origin <origin>]
+  bfa screenshot [url] [--full-page] [--name <file>] [--home <dir>] [--browser <path>] [--headless]
+  bfa open <url> [--home <dir>] [--browser <path>] [--allow-origin <origin>]
   bfa status [--home <dir>]
 
 Actions:
-  goto, click, type, fill, press, select, hover, scroll, wait`);
+  goto, click, type, fill, press, select, hover, scroll, wait, screenshot`);
 }
 
 function parseCli(argv) {
@@ -31,11 +32,11 @@ function parseCli(argv) {
     const [rawKey, rawValue] = arg.slice(2).split("=", 2);
     const key = rawKey.replaceAll("-", "_");
     if (rawValue !== undefined) {
-      flags[key] = rawValue;
-    } else if (["pretty", "headless"].includes(key)) {
+      setFlag(flags, key, rawValue);
+    } else if (["pretty", "headless", "full_page"].includes(key)) {
       flags[key] = true;
     } else {
-      flags[key] = argv[i + 1];
+      setFlag(flags, key, argv[i + 1]);
       i += 1;
     }
   }
@@ -43,11 +44,27 @@ function parseCli(argv) {
   return { positionals, flags };
 }
 
+function setFlag(flags, key, value) {
+  if (key === "allow_origin") {
+    flags[key] = [...(Array.isArray(flags[key]) ? flags[key] : []), value];
+    return;
+  }
+
+  if (["pretty", "headless", "full_page"].includes(key)) {
+    flags[key] = value === true || value === "true";
+    return;
+  }
+
+  flags[key] = value;
+}
+
 function browserOptions(flags) {
   return {
     homeDir: flags.home,
     executablePath: flags.browser,
-    headless: flags.headless
+    headless: flags.headless,
+    screenshotsDir: flags.screenshots,
+    allowedOrigins: flags.allow_origin
   };
 }
 
@@ -125,6 +142,14 @@ async function main() {
 
     if (command === "session") {
       await runSession(browser, positionals[0]);
+      return;
+    }
+
+    if (command === "screenshot") {
+      if (positionals[0]) {
+        await browser.open(positionals[0]);
+      }
+      printJson(await browser.screenshot({ name: flags.name, fullPage: flags.full_page }), flags.pretty);
       return;
     }
 

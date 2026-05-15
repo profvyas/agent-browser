@@ -5,6 +5,7 @@ import { chromium } from "playwright-core";
 
 const DEFAULT_VIEWPORT = { width: 1365, height: 900 };
 const MAX_RECENT_EVENTS = 40;
+const MAX_DOWNLOAD_EVENTS = 20;
 
 export async function createAgentBrowser(options = {}) {
   const browser = new AgentBrowser(options);
@@ -46,6 +47,8 @@ export class AgentBrowser {
     this.page = undefined;
     this.networkEvents = [];
     this.consoleEvents = [];
+    this.downloadEvents = [];
+    this.latestScreenshotPath = "";
   }
 
   async start() {
@@ -54,6 +57,7 @@ export class AgentBrowser {
     ensureDir(this.options.homeDir);
     ensureDir(this.options.profileDir);
     ensureDir(this.options.downloadsDir);
+    ensureDir(this.options.screenshotsDir);
 
     const launchOptions = {
       acceptDownloads: true,
@@ -87,6 +91,7 @@ export class AgentBrowser {
 
   async open(url) {
     await this.ensureStarted();
+    assertUrlAllowed(url, this.options.allowedOrigins);
     await this.page.goto(url, { waitUntil: "domcontentloaded" });
     await this.saveStorageState();
     return this.page;
@@ -95,12 +100,15 @@ export class AgentBrowser {
   async observe(url) {
     await this.ensureStarted();
     if (url) {
+      assertUrlAllowed(url, this.options.allowedOrigins);
       await this.page.goto(url, { waitUntil: "domcontentloaded" });
     }
 
     const observation = await buildObservation(this.page, {
       networkEvents: this.networkEvents,
-      consoleEvents: this.consoleEvents
+      consoleEvents: this.consoleEvents,
+      downloadEvents: this.downloadEvents,
+      latestScreenshotPath: this.latestScreenshotPath
     });
 
     ensureDir(path.dirname(this.options.latestObservationPath));
@@ -114,7 +122,7 @@ export class AgentBrowser {
     const actions = Array.isArray(input?.actions) ? input.actions : [input];
 
     for (const action of actions) {
-      await performAction(this.page, action);
+      await performAction(this.page, action, this);
     }
 
     return this.observe();
@@ -122,6 +130,21 @@ export class AgentBrowser {
 
   async status() {
     return readStatus(this.options);
+  }
+
+  async screenshot(options = {}) {
+    await this.ensureStarted();
+    const fileName = screenshotFileName(options.name);
+    const screenshotPath = path.join(this.options.screenshotsDir, fileName);
+    await this.page.screenshot({
+      path: screenshotPath,
+      fullPage: Boolean(options.fullPage)
+    });
+    this.latestScreenshotPath = screenshotPath;
+    return {
+      path: screenshotPath,
+      fullPage: Boolean(options.fullPage)
+    };
   }
 
   async close() {
@@ -172,6 +195,29 @@ export class AgentBrowser {
       });
       this.consoleEvents = this.consoleEvents.slice(-MAX_RECENT_EVENTS);
     });
+
+    page.on("download", async (download) => {
+      const suggested = download.suggestedFilename();
+      const fileName = uniqueArtifactName(suggested || "download");
+      const downloadPath = path.join(this.options.downloadsDir, fileName);
+
+      try {
+        await download.saveAs(downloadPath);
+        this.pushDownloadEvent({
+          url: download.url(),
+          suggestedFilename: suggested,
+          path: downloadPath
+        });
+      } catch (error) {
+        this.pushDownloadEvent({
+          url: download.url(),
+          suggestedFilename: suggested,
+          path: downloadPath,
+          failed: true,
+          error: error.message
+        });
+      }
+    });
   }
 
   async pushNetworkEvent(event) {
@@ -181,6 +227,11 @@ export class AgentBrowser {
     }
     this.networkEvents.push(resolved);
     this.networkEvents = this.networkEvents.slice(-MAX_RECENT_EVENTS);
+  }
+
+  pushDownloadEvent(event) {
+    this.downloadEvents.push(event);
+    this.downloadEvents = this.downloadEvents.slice(-MAX_DOWNLOAD_EVENTS);
   }
 }
 
@@ -200,7 +251,9 @@ function readStatus(options) {
     profile: options.profileDir,
     storageState: options.storageStatePath,
     downloads: options.downloadsDir,
+    screenshots: options.screenshotsDir,
     latestObservation: options.latestObservationPath,
+    allowedOrigins: options.allowedOrigins,
     savedStateExists: stateExists,
     savedCookies: cookieCount,
     savedOrigins: originCount
@@ -209,18 +262,45 @@ function readStatus(options) {
 
 function normalizeOptions(options) {
   const homeDir = path.resolve(expandHome(options.homeDir || process.env.BFA_HOME || "~/.browser-for-agents"));
+  const allowedOrigins = normalizeAllowedOrigins(options.allowedOrigins || process.env.BFA_ALLOWED_ORIGINS);
   return {
     homeDir,
     profileDir: path.resolve(options.profileDir || path.join(homeDir, "profile")),
     storageStatePath: path.resolve(options.storageStatePath || path.join(homeDir, "storage-state.json")),
     downloadsDir: path.resolve(options.downloadsDir || path.join(homeDir, "downloads")),
+    screenshotsDir: path.resolve(options.screenshotsDir || path.join(homeDir, "screenshots")),
     latestObservationPath: path.resolve(options.latestObservationPath || path.join(homeDir, "latest-observation.json")),
     executablePath: options.executablePath || process.env.BFA_BROWSER_EXE,
     browserChannel: options.browserChannel || "chrome",
     headless: options.headless ?? process.env.BFA_HEADLESS === "1",
     defaultTimeoutMs: options.defaultTimeoutMs || 30000,
-    viewport: options.viewport || DEFAULT_VIEWPORT
+    viewport: options.viewport || DEFAULT_VIEWPORT,
+    allowedOrigins
   };
+}
+
+function normalizeAllowedOrigins(value) {
+  const raw = Array.isArray(value) ? value : String(value || "").split(",");
+  return raw
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      if (entry === "*") return entry;
+      try {
+        return new URL(entry).origin;
+      } catch {
+        return new URL(`https://${entry}`).origin;
+      }
+    });
+}
+
+function assertUrlAllowed(url, allowedOrigins = []) {
+  if (!allowedOrigins.length || allowedOrigins.includes("*")) return;
+
+  const origin = new URL(url).origin;
+  if (!allowedOrigins.includes(origin)) {
+    throw new Error(`Navigation blocked by allowed origins policy: ${origin}`);
+  }
 }
 
 function expandHome(value) {
@@ -294,6 +374,7 @@ async function buildObservation(page, events) {
     meta: pageData.meta,
     headings: pageData.headings,
     forms: pageData.forms,
+    state: pageData.state,
     network: {
       requests: networkEvents.length,
       failed: failedRequests.length,
@@ -303,6 +384,13 @@ async function buildObservation(page, events) {
       messages: events.consoleEvents.length,
       errors: consoleErrors.length,
       recent: events.consoleEvents.slice(-10)
+    },
+    downloads: {
+      count: events.downloadEvents.length,
+      recent: events.downloadEvents.slice(-10)
+    },
+    artifacts: {
+      latestScreenshot: events.latestScreenshotPath || ""
     },
     elements: pageData.elements
   };
@@ -377,6 +465,19 @@ function collectPageData() {
         value: field.value || ""
       }))
     })),
+    state: {
+      activeElement: describeActiveElement(),
+      scroll: {
+        x: Math.round(window.scrollX),
+        y: Math.round(window.scrollY),
+        maxX: Math.max(0, document.documentElement.scrollWidth - window.innerWidth),
+        maxY: Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
+      },
+      document: {
+        width: document.documentElement.scrollWidth,
+        height: document.documentElement.scrollHeight
+      }
+    },
     elements
   };
 
@@ -501,16 +602,36 @@ function collectPageData() {
   function firstNonEmpty(...values) {
     return values.map((value) => cleanText(value)).find(Boolean) || "";
   }
+
+  function describeActiveElement() {
+    const element = document.activeElement;
+    if (!element || element === document.body || element === document.documentElement) {
+      return null;
+    }
+
+    return {
+      tagName: element.tagName.toLowerCase(),
+      role: roleFor(element),
+      name: firstNonEmpty(
+        element.getAttribute("aria-label"),
+        labelFor(element),
+        element.getAttribute("name"),
+        element.getAttribute("placeholder"),
+        element.getAttribute("title"),
+        element.innerText || element.textContent || ""
+      )
+    };
+  }
 }
 
-async function performAction(page, action) {
+async function performAction(page, action, browser) {
   if (!action || typeof action !== "object") {
     throw new Error("Action must be an object.");
   }
 
   if (Array.isArray(action.actions)) {
     for (const childAction of action.actions) {
-      await performAction(page, childAction);
+      await performAction(page, childAction, browser);
     }
     return;
   }
@@ -518,6 +639,7 @@ async function performAction(page, action) {
   switch (action.action) {
     case "goto":
       if (!action.url) throw new Error("goto requires url.");
+      assertUrlAllowed(action.url, browser?.options.allowedOrigins);
       await page.goto(action.url, { waitUntil: action.waitUntil || "domcontentloaded" });
       return;
     case "click":
@@ -547,11 +669,46 @@ async function performAction(page, action) {
       await scrollPage(page, action);
       return;
     case "wait":
-      await page.waitForTimeout(action.ms || 1000);
+      await waitFor(page, action);
+      return;
+    case "screenshot":
+      await browser.screenshot(action);
       return;
     default:
       throw new Error(`Unsupported action: ${action.action}`);
   }
+}
+
+async function waitFor(page, action) {
+  const timeout = action.timeoutMs || action.timeout || undefined;
+
+  if (action.selector) {
+    await page.locator(action.selector).first().waitFor({ state: action.state || "visible", timeout });
+    return;
+  }
+
+  if (action.target) {
+    const locator = await resolveTarget(page, action.target);
+    await locator.waitFor?.({ state: action.state || "visible", timeout });
+    return;
+  }
+
+  if (action.text) {
+    await page.getByText(action.text, { exact: Boolean(action.exact) }).first().waitFor({ timeout });
+    return;
+  }
+
+  if (action.url) {
+    await page.waitForURL(action.url, { timeout });
+    return;
+  }
+
+  if (action.loadState) {
+    await page.waitForLoadState(action.loadState, { timeout });
+    return;
+  }
+
+  await page.waitForTimeout(action.ms || 1000);
 }
 
 async function withTarget(page, target, fn) {
@@ -615,6 +772,7 @@ function locatorForElementHandle(page, element) {
     click: (...args) => element.click(...args),
     fill: (...args) => element.fill(...args),
     press: (...args) => element.press(...args),
+    waitFor: (...args) => element.waitForElementState("visible", ...args),
     pressSequentially: async (value) => {
       await element.focus();
       await page.keyboard.type(value);
@@ -643,4 +801,17 @@ async function scrollPage(page, action) {
   };
   const [wheelX, wheelY] = byDirection[direction] || byDirection.down;
   await page.mouse.wheel(wheelX, wheelY);
+}
+
+function screenshotFileName(name) {
+  if (name) return uniqueArtifactName(name.endsWith(".png") ? name : `${name}.png`);
+  return uniqueArtifactName("screenshot.png");
+}
+
+function uniqueArtifactName(name) {
+  const parsed = path.parse(name);
+  const safeBase = (parsed.name || "artifact").replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 80);
+  const safeExt = parsed.ext || "";
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `${stamp}-${safeBase}${safeExt}`;
 }
