@@ -6,6 +6,26 @@ import { chromium } from "playwright-core";
 const DEFAULT_VIEWPORT = { width: 1365, height: 900 };
 const MAX_RECENT_EVENTS = 40;
 const MAX_DOWNLOAD_EVENTS = 20;
+const REDACTED_ACTION_FIELDS = new Set(["value", "values", "text", "password", "token", "secret"]);
+const BUILT_IN_POLICIES = {
+  open: { allowedOrigins: ["*"] },
+  local: { allowedOrigins: ["http://localhost:*", "http://127.0.0.1:*", "file://*"] }
+};
+
+export class BrowserActionError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = "BrowserActionError";
+    this.code = details.code || "BFA_ACTION_FAILED";
+    this.action = details.action;
+    this.actionIndex = details.actionIndex;
+    this.cause = details.cause;
+  }
+
+  toJSON() {
+    return serializeError(this);
+  }
+}
 
 export async function createAgentBrowser(options = {}) {
   const browser = new AgentBrowser(options);
@@ -85,7 +105,10 @@ export class AgentBrowser {
     this.page = this.context.pages()[0] || await this.context.newPage();
     this.page.setDefaultTimeout(this.options.defaultTimeoutMs);
     this.attachPageListeners(this.page);
-    this.context.on("page", (page) => this.attachPageListeners(page));
+    this.context.on("page", (page) => {
+      page.setDefaultTimeout(this.options.defaultTimeoutMs);
+      this.attachPageListeners(page);
+    });
     return this;
   }
 
@@ -104,12 +127,17 @@ export class AgentBrowser {
       await this.page.goto(url, { waitUntil: "domcontentloaded" });
     }
 
+    if (this.options.observeScreenshots) {
+      await this.screenshot({ name: "observe", fullPage: this.options.observeScreenshotFullPage });
+    }
+
     const observation = await buildObservation(this.page, {
       networkEvents: this.networkEvents,
       consoleEvents: this.consoleEvents,
       downloadEvents: this.downloadEvents,
       latestScreenshotPath: this.latestScreenshotPath
     });
+    observation.pages = await this.describePages();
 
     ensureDir(path.dirname(this.options.latestObservationPath));
     fs.writeFileSync(this.options.latestObservationPath, `${JSON.stringify(observation, null, 2)}\n`);
@@ -121,8 +149,19 @@ export class AgentBrowser {
     await this.ensureStarted();
     const actions = Array.isArray(input?.actions) ? input.actions : [input];
 
-    for (const action of actions) {
-      await performAction(this.page, action, this);
+    for (let actionIndex = 0; actionIndex < actions.length; actionIndex += 1) {
+      const action = actions[actionIndex];
+      this.writeAuditEvent("action:start", { actionIndex, action });
+      try {
+        await performAction(this.page, action, this);
+        this.writeAuditEvent("action:finish", { actionIndex, action });
+      } catch (error) {
+        const wrapped = error instanceof BrowserActionError
+          ? error
+          : new BrowserActionError(error.message, { action, actionIndex, cause: error });
+        this.writeAuditEvent("action:error", { actionIndex, action, error: serializeError(wrapped) });
+        throw wrapped;
+      }
     }
 
     return this.observe();
@@ -145,6 +184,64 @@ export class AgentBrowser {
       path: screenshotPath,
       fullPage: Boolean(options.fullPage)
     };
+  }
+
+  async newPage(url) {
+    await this.ensureStarted();
+    if (url) assertUrlAllowed(url, this.options.allowedOrigins);
+    this.page = await this.context.newPage();
+    this.page.setDefaultTimeout(this.options.defaultTimeoutMs);
+    this.attachPageListeners(this.page);
+    if (url) {
+      await this.page.goto(url, { waitUntil: "domcontentloaded" });
+    }
+    return this.page;
+  }
+
+  async switchPage(selector = {}) {
+    await this.ensureStarted();
+    const pages = this.context.pages();
+    const index = selector.index !== undefined ? Number(selector.index) : undefined;
+
+    if (Number.isInteger(index)) {
+      if (!pages[index]) throw new Error(`No page at index ${index}.`);
+      this.page = pages[index];
+      return this.page;
+    }
+
+    if (selector.url || selector.title) {
+      for (const page of pages) {
+        const title = await page.title().catch(() => "");
+        const url = page.url();
+        if ((selector.url && url.includes(selector.url)) || (selector.title && title.includes(selector.title))) {
+          this.page = page;
+          return this.page;
+        }
+      }
+    }
+
+    throw new Error("switchPage requires a matching index, url, or title.");
+  }
+
+  async closePage(selector = {}) {
+    await this.ensureStarted();
+    const page = selector.index !== undefined || selector.url || selector.title
+      ? await this.switchPage(selector)
+      : this.page;
+    await page.close();
+    this.page = this.context.pages()[0] || await this.context.newPage();
+    return this.page;
+  }
+
+  async describePages() {
+    if (!this.context) return [];
+    const pages = this.context.pages();
+    return Promise.all(pages.map(async (page, index) => ({
+      index,
+      active: page === this.page,
+      url: page.url(),
+      title: await page.title().catch(() => "")
+    })));
   }
 
   async close() {
@@ -233,6 +330,20 @@ export class AgentBrowser {
     this.downloadEvents.push(event);
     this.downloadEvents = this.downloadEvents.slice(-MAX_DOWNLOAD_EVENTS);
   }
+
+  writeAuditEvent(type, details = {}) {
+    if (!this.options.auditEnabled || !this.options.auditLogPath) return;
+
+    ensureDir(path.dirname(this.options.auditLogPath));
+    const event = {
+      ts: new Date().toISOString(),
+      type,
+      page: this.page?.url?.() || "",
+      ...details,
+      action: details.action ? redactAction(details.action, this.options.redactAction) : undefined
+    };
+    fs.appendFileSync(this.options.auditLogPath, `${JSON.stringify(removeUndefined(event))}\n`);
+  }
 }
 
 function readStatus(options) {
@@ -253,6 +364,12 @@ function readStatus(options) {
     downloads: options.downloadsDir,
     screenshots: options.screenshotsDir,
     latestObservation: options.latestObservationPath,
+    auditLog: options.auditLogPath,
+    auditEnabled: options.auditEnabled,
+    profileName: options.profileName,
+    profileRoot: options.profileRoot,
+    policyName: options.policyName,
+    policyFile: options.policyFile,
     allowedOrigins: options.allowedOrigins,
     savedStateExists: stateExists,
     savedCookies: cookieCount,
@@ -261,22 +378,50 @@ function readStatus(options) {
 }
 
 function normalizeOptions(options) {
-  const homeDir = path.resolve(expandHome(options.homeDir || process.env.BFA_HOME || "~/.browser-for-agents"));
-  const allowedOrigins = normalizeAllowedOrigins(options.allowedOrigins || process.env.BFA_ALLOWED_ORIGINS);
+  const policyOptions = loadPolicyOptions(options);
+  const merged = { ...policyOptions, ...options };
+  const homeDir = path.resolve(expandHome(merged.homeDir || process.env.BFA_HOME || "~/.browser-for-agents"));
+  const profileName = merged.profileName || process.env.BFA_PROFILE || "";
+  const profileRoot = profileName ? path.join(homeDir, "profiles", safeName(profileName)) : homeDir;
+  const allowedOrigins = normalizeAllowedOrigins(merged.allowedOrigins || process.env.BFA_ALLOWED_ORIGINS);
   return {
     homeDir,
-    profileDir: path.resolve(options.profileDir || path.join(homeDir, "profile")),
-    storageStatePath: path.resolve(options.storageStatePath || path.join(homeDir, "storage-state.json")),
-    downloadsDir: path.resolve(options.downloadsDir || path.join(homeDir, "downloads")),
-    screenshotsDir: path.resolve(options.screenshotsDir || path.join(homeDir, "screenshots")),
-    latestObservationPath: path.resolve(options.latestObservationPath || path.join(homeDir, "latest-observation.json")),
-    executablePath: options.executablePath || process.env.BFA_BROWSER_EXE,
-    browserChannel: options.browserChannel || "chrome",
-    headless: options.headless ?? process.env.BFA_HEADLESS === "1",
-    defaultTimeoutMs: options.defaultTimeoutMs || 30000,
-    viewport: options.viewport || DEFAULT_VIEWPORT,
+    profileName,
+    profileRoot,
+    policyName: merged.policyName || process.env.BFA_POLICY || "",
+    policyFile: merged.policyFile || process.env.BFA_POLICY_FILE || "",
+    profileDir: path.resolve(merged.profileDir || path.join(profileRoot, "profile")),
+    storageStatePath: path.resolve(merged.storageStatePath || path.join(profileRoot, "storage-state.json")),
+    downloadsDir: path.resolve(merged.downloadsDir || path.join(profileRoot, "downloads")),
+    screenshotsDir: path.resolve(merged.screenshotsDir || path.join(profileRoot, "screenshots")),
+    latestObservationPath: path.resolve(merged.latestObservationPath || path.join(profileRoot, "latest-observation.json")),
+    auditLogPath: path.resolve(merged.auditLogPath || path.join(profileRoot, "audit.jsonl")),
+    auditEnabled: merged.auditEnabled ?? process.env.BFA_AUDIT_DISABLED !== "1",
+    redactAction: typeof merged.redactAction === "function" ? merged.redactAction : undefined,
+    executablePath: merged.executablePath || process.env.BFA_BROWSER_EXE,
+    browserChannel: merged.browserChannel || "chrome",
+    headless: merged.headless ?? process.env.BFA_HEADLESS === "1",
+    defaultTimeoutMs: merged.defaultTimeoutMs || 30000,
+    viewport: merged.viewport || DEFAULT_VIEWPORT,
+    observeScreenshots: merged.observeScreenshots ?? process.env.BFA_OBSERVE_SCREENSHOTS === "1",
+    observeScreenshotFullPage: merged.observeScreenshotFullPage ?? process.env.BFA_OBSERVE_SCREENSHOT_FULL_PAGE === "1",
     allowedOrigins
   };
+}
+
+function loadPolicyOptions(options) {
+  const policyName = options.policyName || process.env.BFA_POLICY || "";
+  const policyFile = options.policyFile || process.env.BFA_POLICY_FILE || "";
+  const builtIn = policyName ? BUILT_IN_POLICIES[policyName] : undefined;
+
+  if (policyName && !builtIn) {
+    throw new Error(`Unknown policy preset: ${policyName}`);
+  }
+
+  if (!policyFile) return builtIn || {};
+
+  const parsed = JSON.parse(fs.readFileSync(path.resolve(expandHome(policyFile)), "utf8"));
+  return { ...(builtIn || {}), ...parsed };
 }
 
 function normalizeAllowedOrigins(value) {
@@ -286,6 +431,7 @@ function normalizeAllowedOrigins(value) {
     .filter(Boolean)
     .map((entry) => {
       if (entry === "*") return entry;
+      if (entry.includes("*")) return entry;
       try {
         return new URL(entry).origin;
       } catch {
@@ -298,9 +444,17 @@ function assertUrlAllowed(url, allowedOrigins = []) {
   if (!allowedOrigins.length || allowedOrigins.includes("*")) return;
 
   const origin = new URL(url).origin;
-  if (!allowedOrigins.includes(origin)) {
+  if (!allowedOrigins.some((allowedOrigin) => originMatches(origin, allowedOrigin))) {
     throw new Error(`Navigation blocked by allowed origins policy: ${origin}`);
   }
+}
+
+function originMatches(origin, pattern) {
+  if (pattern === "*") return true;
+  if (pattern === origin) return true;
+  if (!pattern.includes("*")) return false;
+  const escaped = pattern.split("*").map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*");
+  return new RegExp(`^${escaped}$`).test(origin);
 }
 
 function expandHome(value) {
@@ -310,6 +464,10 @@ function expandHome(value) {
 
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
+}
+
+function safeName(value) {
+  return String(value || "default").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "default";
 }
 
 export function findBrowserExecutable() {
@@ -557,9 +715,13 @@ function collectPageData() {
 
   function actionsFor(element, role) {
     const tagName = element.tagName.toLowerCase();
+    const type = (element.getAttribute("type") || "").toLowerCase();
     const actions = ["click", "hover"];
     if (["textbox", "searchbox"].includes(role) || element.isContentEditable) {
       actions.push("fill", "type", "press");
+    }
+    if (tagName === "input" && type === "file") {
+      actions.push("upload", "setInputFiles");
     }
     if (["button", "link", "checkbox", "radio"].includes(role)) {
       actions.push("press");
@@ -640,30 +802,34 @@ async function performAction(page, action, browser) {
     case "goto":
       if (!action.url) throw new Error("goto requires url.");
       assertUrlAllowed(action.url, browser?.options.allowedOrigins);
-      await page.goto(action.url, { waitUntil: action.waitUntil || "domcontentloaded" });
+      await page.goto(action.url, { waitUntil: action.waitUntil || "domcontentloaded", timeout: actionTimeout(action) });
       return;
     case "click":
-      await withTarget(page, action.target, (locator) => locator.click());
+      await withTarget(page, action.target, (locator) => locator.click({ timeout: actionTimeout(action) }));
       return;
     case "type":
-      await withTarget(page, action.target, (locator) => locator.pressSequentially(action.value || action.text || ""));
+      await withTarget(page, action.target, (locator) => locator.pressSequentially(action.value || action.text || "", { timeout: actionTimeout(action) }));
       return;
     case "fill":
-      await withTarget(page, action.target, (locator) => locator.fill(action.value || ""));
+      await withTarget(page, action.target, (locator) => locator.fill(action.value || "", { timeout: actionTimeout(action) }));
       return;
     case "press":
       if (!action.key) throw new Error("press requires key.");
       if (action.target) {
-        await withTarget(page, action.target, (locator) => locator.press(action.key));
+        await withTarget(page, action.target, (locator) => locator.press(action.key, { timeout: actionTimeout(action) }));
       } else {
-        await page.keyboard.press(action.key);
+        await page.keyboard.press(action.key, { timeout: actionTimeout(action) });
       }
       return;
     case "select":
-      await withTarget(page, action.target, (locator) => locator.selectOption(action.value ?? action.values));
+      await withTarget(page, action.target, (locator) => locator.selectOption(action.value ?? action.values, { timeout: actionTimeout(action) }));
       return;
     case "hover":
-      await withTarget(page, action.target, (locator) => locator.hover());
+      await withTarget(page, action.target, (locator) => locator.hover({ timeout: actionTimeout(action) }));
+      return;
+    case "upload":
+    case "setInputFiles":
+      await uploadFiles(page, action);
       return;
     case "scroll":
       await scrollPage(page, action);
@@ -674,9 +840,23 @@ async function performAction(page, action, browser) {
     case "screenshot":
       await browser.screenshot(action);
       return;
+    case "newPage":
+    case "openPage":
+      await browser.newPage(action.url);
+      return;
+    case "switchPage":
+      await browser.switchPage(action);
+      return;
+    case "closePage":
+      await browser.closePage(action);
+      return;
     default:
       throw new Error(`Unsupported action: ${action.action}`);
   }
+}
+
+function actionTimeout(action) {
+  return action.timeoutMs || action.timeout || undefined;
 }
 
 async function waitFor(page, action) {
@@ -709,6 +889,14 @@ async function waitFor(page, action) {
   }
 
   await page.waitForTimeout(action.ms || 1000);
+}
+
+async function uploadFiles(page, action) {
+  if (!action.target) throw new Error(`${action.action} requires target.`);
+  const files = action.path || action.paths || action.files || action.file;
+  if (!files) throw new Error(`${action.action} requires path, paths, file, or files.`);
+  const normalized = Array.isArray(files) ? files.map(resolveFilePath) : resolveFilePath(files);
+  await withTarget(page, action.target, (locator) => locator.setInputFiles(normalized, { timeout: actionTimeout(action) }));
 }
 
 async function withTarget(page, target, fn) {
@@ -778,7 +966,8 @@ function locatorForElementHandle(page, element) {
       await page.keyboard.type(value);
     },
     selectOption: (...args) => element.selectOption(...args),
-    hover: (...args) => element.hover(...args)
+    hover: (...args) => element.hover(...args),
+    setInputFiles: (...args) => element.setInputFiles(...args)
   };
 }
 
@@ -814,4 +1003,46 @@ function uniqueArtifactName(name) {
   const safeExt = parsed.ext || "";
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   return `${stamp}-${safeBase}${safeExt}`;
+}
+
+function resolveFilePath(filePath) {
+  return path.resolve(expandHome(String(filePath)));
+}
+
+function redactAction(action, customRedactor) {
+  if (customRedactor) return customRedactor(action);
+  return redactValue(action);
+}
+
+function redactValue(value, key = "") {
+  if (Array.isArray(value)) {
+    return value.map((entry) => redactValue(entry, key));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([entryKey, entryValue]) => [
+      entryKey,
+      redactValue(entryValue, entryKey)
+    ]));
+  }
+
+  if (REDACTED_ACTION_FIELDS.has(key) || /password|token|secret/i.test(key)) {
+    return "[redacted]";
+  }
+
+  return value;
+}
+
+export function serializeError(error) {
+  return removeUndefined({
+    name: error.name || "Error",
+    code: error.code,
+    message: error.message,
+    actionIndex: error.actionIndex,
+    action: error.action ? redactAction(error.action) : undefined
+  });
+}
+
+function removeUndefined(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, entryValue]) => entryValue !== undefined));
 }

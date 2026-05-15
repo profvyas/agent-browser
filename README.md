@@ -17,7 +17,11 @@ This branch extends the runtime with:
 - screenshot artifacts
 - richer observations with scroll/document/focus state
 - download summaries
-- wait and screenshot actions
+- wait, screenshot, and upload actions
+- per-profile runtime isolation
+- redacted audit logs for action execution
+- policy presets and JSON policy files
+- basic page/tab selection actions
 
 ## Install
 
@@ -52,6 +56,19 @@ Restrict a session to known origins:
 
 ```sh
 bfa observe https://example.com --allow-origin https://example.com --pretty
+```
+
+Use a separate profile for a user, domain, or task:
+
+```sh
+bfa session https://example.com --profile example-prod --allow-origin https://example.com
+```
+
+Use a built-in policy preset or JSON policy file:
+
+```sh
+bfa observe http://localhost:3000 --policy local
+bfa session https://example.com --policy-file ./bfa-policy.json
 ```
 
 Run one action and receive a fresh observation:
@@ -95,6 +112,20 @@ Supported primitives:
 - `scroll`
 - `wait`
 - `screenshot`
+- `upload`
+- `newPage`
+- `switchPage`
+- `closePage`
+
+Examples:
+
+```jsonl
+{"action":"wait","text":"Dashboard","timeoutMs":5000}
+{"action":"upload","target":"label=Invoice CSV","path":"~/Downloads/invoice.csv"}
+{"action":"screenshot","name":"after-upload","fullPage":true}
+{"action":"newPage","url":"https://example.com/report"}
+{"action":"switchPage","title":"Report"}
+```
 
 Prefer observed ids such as `e12`. Fallback targets are also supported:
 
@@ -170,7 +201,14 @@ Runtime files are stored outside your project:
   storage-state.json
   downloads/
   screenshots/
+  audit.jsonl
   latest-observation.json
+```
+
+When `--profile <name>` or `BFA_PROFILE` is set, runtime files move under:
+
+```text
+~/.browser-for-agents/profiles/<name>/
 ```
 
 Environment overrides:
@@ -179,13 +217,29 @@ Environment overrides:
 - `BFA_BROWSER_EXE`: explicit Chrome/Edge/Chromium executable
 - `BFA_HEADLESS=1`: run headless
 - `BFA_ALLOWED_ORIGINS`: comma-separated origin allowlist
+- `BFA_PROFILE`: profile name for isolated runtime state
+- `BFA_POLICY`: built-in policy preset (`open` or `local`)
+- `BFA_POLICY_FILE`: path to a JSON policy file
+- `BFA_OBSERVE_SCREENSHOTS=1`: save a screenshot during every observation
+- `BFA_AUDIT_DISABLED=1`: disable action audit logging
 
 Useful flags:
 
 ```sh
 bfa observe https://example.com --home /tmp/bfa --browser /path/to/chrome
 bfa observe https://example.com --allow-origin https://example.com
+bfa session https://example.com --profile customer-a
+bfa observe http://localhost:3000 --policy local
 bfa session --headless
+```
+
+Policy files are JSON and currently support the same option names as the API:
+
+```json
+{
+  "allowedOrigins": ["https://example.com"],
+  "observeScreenshots": true
+}
 ```
 
 ## Development
