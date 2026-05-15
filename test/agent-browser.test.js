@@ -47,12 +47,14 @@ test("observe returns page meta and actionable elements", async (t) => {
 
 test("status reads runtime paths without launching a browser", () => {
   const homeDir = tmpHome("status");
-  const status = getAgentBrowserStatus({ homeDir });
+  const status = getAgentBrowserStatus({ homeDir, allowedOrigins: ["https://example.com"] });
 
   assert.equal(status.home, homeDir);
   assert.equal(status.savedStateExists, false);
   assert.equal(status.savedCookies, 0);
   assert.match(status.profile, /profile$/);
+  assert.match(status.screenshots, /screenshots$/);
+  assert.deepEqual(status.allowedOrigins, ["https://example.com"]);
 });
 
 test("act supports observed ids and returns a fresh observation", async (t) => {
@@ -98,6 +100,74 @@ test("act supports fallback targets", async (t) => {
     await browser.act({ action: "click", target: "role=button:Run search" });
 
     assert.match(await browser.page.locator("#result").innerText(), /fallback on zepto/);
+  } finally {
+    await browser.close();
+  }
+});
+
+test("allowed origins block unexpected navigation", async (t) => {
+  if (shouldSkipWithoutBrowser(t)) return;
+  const browser = await createAgentBrowser({
+    homeDir: tmpHome("allowlist"),
+    executablePath: browserExecutable,
+    headless: true,
+    allowedOrigins: ["https://allowed.example"]
+  });
+
+  try {
+    await assert.rejects(
+      () => browser.observe(fixtureUrl),
+      /Navigation blocked by allowed origins policy/
+    );
+  } finally {
+    await browser.close();
+  }
+});
+
+test("screenshot action saves an artifact and records it in observations", async (t) => {
+  if (shouldSkipWithoutBrowser(t)) return;
+  const homeDir = tmpHome("screenshot");
+  const browser = await createAgentBrowser({
+    homeDir,
+    executablePath: browserExecutable,
+    headless: true
+  });
+
+  try {
+    await browser.observe(fixtureUrl);
+    const observation = await browser.act({ action: "screenshot", name: "fixture", fullPage: true });
+
+    assert.match(observation.artifacts.latestScreenshot, /fixture\.png$/);
+    assert.ok(fs.existsSync(observation.artifacts.latestScreenshot));
+    assert.match(observation.artifacts.latestScreenshot, new RegExp(`${path.basename(homeDir)}/screenshots`));
+  } finally {
+    await browser.close();
+  }
+});
+
+test("wait action supports visible text", async (t) => {
+  if (shouldSkipWithoutBrowser(t)) return;
+  const browser = await createAgentBrowser({
+    homeDir: tmpHome("wait"),
+    executablePath: browserExecutable,
+    headless: true
+  });
+
+  try {
+    let observation = await browser.observe(fixtureUrl);
+    const input = observation.elements.find((element) => element.role === "textbox");
+    const button = observation.elements.find((element) => element.role === "button" && element.name === "Run search");
+
+    observation = await browser.act({
+      actions: [
+        { action: "fill", target: input.id, value: "wait check" },
+        { action: "click", target: button.id },
+        { action: "wait", text: "wait check on zepto", timeoutMs: 1000 }
+      ]
+    });
+
+    assert.ok(observation.state.scroll.maxY > 0);
+    assert.ok(observation.elements.some((element) => element.value === "wait check"));
   } finally {
     await browser.close();
   }

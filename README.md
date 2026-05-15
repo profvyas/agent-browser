@@ -11,6 +11,14 @@ It uses `playwright-core` with your system Chrome or Edge by default, keeps a
 persistent profile under `~/.browser-for-agents`, and exposes both a global CLI
 and a JavaScript API.
 
+This branch extends the runtime with:
+
+- explicit origin allowlists for safer authenticated sessions
+- screenshot artifacts
+- richer observations with scroll/document/focus state
+- download summaries
+- wait and screenshot actions
+
 ## Install
 
 ```sh
@@ -40,10 +48,22 @@ Observe a page as JSON:
 bfa observe https://example.com --pretty
 ```
 
+Restrict a session to known origins:
+
+```sh
+bfa observe https://example.com --allow-origin https://example.com --pretty
+```
+
 Run one action and receive a fresh observation:
 
 ```sh
 bfa act '{"action":"goto","url":"https://example.com"}' --pretty
+```
+
+Capture a screenshot artifact:
+
+```sh
+bfa screenshot https://example.com --name home --full-page --pretty
 ```
 
 Run a long-lived JSONL session:
@@ -74,6 +94,7 @@ Supported primitives:
 - `hover`
 - `scroll`
 - `wait`
+- `screenshot`
 
 Prefer observed ids such as `e12`. Fallback targets are also supported:
 
@@ -104,6 +125,9 @@ Observations are intentionally compact and machine-readable:
     "requests": 1,
     "failed": 0,
     "recent": []
+  },
+  "artifacts": {
+    "latestScreenshot": ""
   },
   "elements": [
     {
@@ -145,6 +169,7 @@ Runtime files are stored outside your project:
   profile/
   storage-state.json
   downloads/
+  screenshots/
   latest-observation.json
 ```
 
@@ -153,11 +178,13 @@ Environment overrides:
 - `BFA_HOME`: runtime directory
 - `BFA_BROWSER_EXE`: explicit Chrome/Edge/Chromium executable
 - `BFA_HEADLESS=1`: run headless
+- `BFA_ALLOWED_ORIGINS`: comma-separated origin allowlist
 
 Useful flags:
 
 ```sh
 bfa observe https://example.com --home /tmp/bfa --browser /path/to/chrome
+bfa observe https://example.com --allow-origin https://example.com
 bfa session --headless
 ```
 
